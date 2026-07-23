@@ -50,7 +50,7 @@ colFVG      = input.color(color.new(#2196F3, 80),     "FVG",                    
 colEntry    = input.color(color.new(#00E676, 85),     "منطقة الدخول / Entry Zone",          group = grpStyle)
 
 grpGen      = "⑥ عام / General"
-cleanupBars = input.int(20, "حذف العنصر بعد (شمعة) / Auto-delete after (bars)", minval = 5, group = grpGen)
+autoClean   = input.bool(false, "حذف الإشارات تلقائياً عند الإلغاء / Auto-delete signals on cancel", group = grpGen, tooltip = "معطّل افتراضياً: كل الإشارات (Sweep, SMT, MSS, CISD, FVG) تبقى ظاهرة على الشارت للمراجعة ولا تُحذف عند إلغاء الإعداد")
 
 // وضع تحوّل السيطرة / control-shift mode flags
 isMSSonly  = modeOpt == "MSS فقط / MSS only"
@@ -283,41 +283,15 @@ if barstate.isconfirmed
     if not inNY and st != 0
         cancel := true
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  آلة الحالة — نُقدّم الإعداد النشط أولاً (الحالات 1..4)، ثم مسح السحب لاحقاً
+    //  ملاحظة: رسم الـ Sweep و SMT صار مستقلاً (أسفل) ليظهر لكل مستوى ويبقى دائماً
+    // ═══════════════════════════════════════════════════════════════════════
     if inNY
-        // ───────────────────────────────────────────────────────────────────
-        // الحالة 0: خامل — ابحث عن Sweep لبدء إعداد (حد إشارتين/يوم)
-        // ───────────────────────────────────────────────────────────────────
-        if st == 0 and sigToday < 2 and array.size(liqLevels) > 0
-            for i = 0 to array.size(liqLevels) - 1
-                Liq lv = array.get(liqLevels, i)
-                if st == 0 and not lv.broken and not lv.swept
-                    sweptHigh =      lv.isHigh and high > lv.price and close < lv.price
-                    sweptLow  = not lv.isHigh and low  < lv.price and close > lv.price
-                    if sweptHigh or sweptLow
-                        lv.swept := true
-                        sBull   := sweptLow            // سحب قاع → إعداد صاعد
-                        sLevel  := lv.price
-                        sWick   := sBull ? low : high
-                        sBar    := bar_index
-                        cnt     := maxWait
-                        smtOn   := sBull ? smtBullEval : smtBearEval
-                        mssDone := false
-                        st      := 1
-                        aSweep  := true
-                        // رسم علامة Sweep برتقالية عند طرف الفتيل
-                        yTip = sBull ? low : high
-                        stl  = sBull ? label.style_label_up : label.style_label_down
-                        sweepLbl := label.new(bar_index, yTip, "✕ SWEEP", xloc = xloc.bar_index, style = stl, color = color.new(colSweep, 15), textcolor = color.white, size = size.small)
-                        // مثلث SMT أصفر إن وُجد التباين (يحدد الحجم فقط)
-                        if smtOn
-                            tstl = sBull ? label.style_triangleup : label.style_triangledown
-                            ytr  = sBull ? low - 3 * tick : high + 3 * tick
-                            smtTri := label.new(bar_index, ytr, "", xloc = xloc.bar_index, style = tstl, color = colSMT, size = size.tiny)
-
         // ───────────────────────────────────────────────────────────────────
         // الحالة 1: بعد Sweep — انتظر تحوّل السيطرة خلال العداد
         // ───────────────────────────────────────────────────────────────────
-        else if st == 1
+        if st == 1
             cnt := cnt - 1
             // إلغاء فوري: شمعتان متتاليتان أغلقتا خارج المستوى = اختراق حقيقي
             outNow  = sBull ? close    < sLevel : close    > sLevel
@@ -446,22 +420,63 @@ if barstate.isconfirmed
             tp2Ln    := na
             st := 0                       // متاح لإعداد ثانٍ (بحد إشارتين/يوم)
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  مسح السحب — يُرسم لكل مستوى ويبقى دائماً (مستقل عن آلة الحالة)
+    //  كل Sweep + مثلث SMT يظهران للمراجعة ولا يُحذفان تلقائياً.
+    //  أول Sweep أثناء الخمول يُتبنّى كإعداد نشط (بحد إشارتين/يوم).
+    // ═══════════════════════════════════════════════════════════════════════
+    if inNY and array.size(liqLevels) > 0
+        for i = 0 to array.size(liqLevels) - 1
+            Liq lv = array.get(liqLevels, i)
+            if not lv.broken and not lv.swept
+                sweptHigh =      lv.isHigh and high > lv.price and close < lv.price
+                sweptLow  = not lv.isHigh and low  < lv.price and close > lv.price
+                if sweptHigh or sweptLow
+                    lv.swept := true
+                    dirBull  = sweptLow             // سحب قاع → صاعد
+                    yTip     = dirBull ? low : high
+                    stl      = dirBull ? label.style_label_up : label.style_label_down
+                    // علامة Sweep برتقالية دائمة عند طرف الفتيل
+                    swLbl = label.new(bar_index, yTip, "✕ SWEEP", xloc = xloc.bar_index, style = stl, color = color.new(colSweep, 15), textcolor = color.white, size = size.small)
+                    // مثلث SMT أصفر دائم إن وُجد التباين (يحدد الحجم فقط)
+                    smtHere = dirBull ? smtBullEval : smtBearEval
+                    label smtObj = na
+                    if smtHere
+                        tstl = dirBull ? label.style_triangleup : label.style_triangledown
+                        ytr  = dirBull ? low - 3 * tick : high + 3 * tick
+                        smtObj := label.new(bar_index, ytr, "", xloc = xloc.bar_index, style = tstl, color = colSMT, size = size.tiny)
+                    aSweep := true
+                    // تبنّي أول Sweep كإعداد نشط عند الخمول
+                    if st == 0 and sigToday < 2
+                        sBull   := dirBull
+                        sLevel  := lv.price
+                        sWick   := yTip
+                        sBar    := bar_index
+                        cnt     := maxWait
+                        smtOn   := smtHere
+                        mssDone := false
+                        st      := 1
+                        sweepLbl := swLbl           // مرجع للحذف الاختياري فقط
+                        smtTri   := smtObj
+
     // ───────────────────────────────────────────────────────────────────────
-    // تنفيذ الإلغاء: احذف كل عناصر الإعداد فوراً (Sweep, SMT, MSS, CISD, FVG…)
+    // إلغاء الإعداد: يُعاد ضبط الحالة دائماً. الحذف الفعلي فقط عند تفعيل autoClean
+    // (افتراضياً معطّل → تبقى كل الإشارات ظاهرة على الشارت للمراجعة).
     // ───────────────────────────────────────────────────────────────────────
     if cancel
-        label.delete(sweepLbl)
-        label.delete(smtTri)
-        line.delete(mssLine)
-        label.delete(mssLbl)
-        line.delete(cisdLine)
-        label.delete(cisdLbl)
-        box.delete(fvgBox)
-        box.delete(entryBox)
-        label.delete(entryLbl)
-        line.delete(stopLn)
-        line.delete(tp1Ln)
-        line.delete(tp2Ln)
+        if autoClean
+            label.delete(sweepLbl)
+            label.delete(smtTri)
+            line.delete(mssLine)
+            label.delete(mssLbl)
+            line.delete(cisdLine)
+            label.delete(cisdLbl)
+            box.delete(fvgBox)
+            box.delete(entryBox)
+            label.delete(entryLbl)
+            line.delete(stopLn)
+            line.delete(tp1Ln)
+            line.delete(tp2Ln)
         sweepLbl := na
         smtTri   := na
         mssLine  := na
