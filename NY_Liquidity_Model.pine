@@ -1,0 +1,184 @@
+//@version=5
+// ════════════════════════════════════════════════════════════════════════════
+//  NY Liquidity Model  —  المرحلة 1 / STAGE 1
+//  مستويات السيولة + فلتر الجلسة + Sweep
+//  Liquidity Levels + Session Filter + Sweep
+// ────────────────────────────────────────────────────────────────────────────
+//  فريم التشغيل الأساسي: 5 دقائق (Primary timeframe: 5m)
+//  للعقود الآجلة: NQ / MNQ / ES في جلسة نيويورك
+// ════════════════════════════════════════════════════════════════════════════
+indicator("NY Liquidity Model", overlay = true, max_boxes_count = 50, max_lines_count = 100, max_labels_count = 50)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  الإعدادات القابلة للتعديل / INPUTS
+// ════════════════════════════════════════════════════════════════════════════
+tz = "America/New_York"   // كل التوقيتات بتوقيت نيويورك / all sessions in NY time
+
+grpSess     = "① نوافذ الجلسات / Session Windows"
+nySession   = input.session("0930-1130", "نافذة تداول نيويورك / NY Trade Window", group = grpSess, tooltip = "الإشارات (Sweep) تُرصد فقط داخل هذه النافذة")
+asiaSession = input.session("1800-0300", "جلسة آسيا / Asia Session",              group = grpSess)
+londonSess  = input.session("0300-0800", "جلسة لندن / London Session",            group = grpSess)
+
+grpToggle   = "② تفعيل المستويات / Level Toggles"
+useAsia     = input.bool(true, "قمة/قاع آسيا / Asia H-L",            group = grpToggle)
+useLondon   = input.bool(true, "قمة/قاع لندن / London H-L",         group = grpToggle)
+usePrevDay  = input.bool(true, "قمة/قاع اليوم السابق / Prev Day H-L", group = grpToggle)
+
+grpStyle    = "③ الألوان / Colors"
+colLiq      = input.color(color.new(color.gray, 60), "مستويات السيولة / Liquidity Levels", group = grpStyle)
+colSweep    = input.color(#FF8C00,                    "Sweep",                              group = grpStyle)
+
+grpGen      = "④ عام / General"
+cleanupBars = input.int(20, "حذف العنصر بعد (شمعة) / Auto-delete after (bars)", minval = 5, group = grpGen, tooltip = "أي علامة Sweep تتجاوز هذا العمر تُحذف تلقائياً للحفاظ على شارت نظيف")
+
+// ════════════════════════════════════════════════════════════════════════════
+//  الأنواع / USER-DEFINED TYPES
+// ════════════════════════════════════════════════════════════════════════════
+// مستوى سيولة واحد (قمة أو قاع) يُرسم كخط أفقي متقطع حتى يُخترق
+type Liq
+    float  price          // سعر المستوى
+    bool   isHigh         // true = قمة/مقاومة ، false = قاع/دعم
+    line   ln             // كائن الخط
+    bool   broken = false // اختُرق بإغلاق خارج المستوى؟
+    bool   swept  = false // سُحبت سيولته مسبقاً؟ (لمنع تكرار العلامة)
+    string tag    = ""    // معرّف فريد (Asia-H, London-L, ...)
+
+// علامة Sweep مرسومة على الشارت
+type Sweep
+    label  lb             // كائن النص/العلامة
+    int    bar            // رقم الشمعة عند الرسم (للحذف بعد cleanupBars)
+    float  lvl            // سعر المستوى المسحوب
+    bool   isHigh         // اتجاه المستوى المسحوب
+
+// ════════════════════════════════════════════════════════════════════════════
+//  الحالة العامة / STATE
+// ════════════════════════════════════════════════════════════════════════════
+var array<Liq>   liqLevels = array.new<Liq>()   // كل المستويات النشطة
+var array<Sweep> sweeps    = array.new<Sweep>()  // كل علامات الـ Sweep الظاهرة
+
+// ════════════════════════════════════════════════════════════════════════════
+//  كشف الجلسات / SESSION DETECTION
+// ════════════════════════════════════════════════════════════════════════════
+inNY     = not na(time(timeframe.period, nySession,   tz))
+inAsia   = not na(time(timeframe.period, asiaSession, tz))
+inLondon = not na(time(timeframe.period, londonSess,  tz))
+
+// بداية يوم تداول جديد (لإضافة مستويات اليوم السابق)
+newDay   = time("D") != time("D")[1]
+
+// ════════════════════════════════════════════════════════════════════════════
+//  دوال مساعدة / HELPER FUNCTIONS
+// ════════════════════════════════════════════════════════════════════════════
+// إضافة/تحديث مستوى سيولة — يحذف أي مستوى قديم بنفس المعرّف للحفاظ على النظافة
+f_addLevel(float px, bool isHigh, string tag) =>
+    if array.size(liqLevels) > 0
+        for i = array.size(liqLevels) - 1 to 0
+            Liq old = array.get(liqLevels, i)
+            if old.tag == tag
+                line.delete(old.ln)
+                array.remove(liqLevels, i)
+    ln = line.new(bar_index, px, bar_index + 1, px, xloc = xloc.bar_index, color = colLiq, style = line.style_dashed, width = 1)
+    array.push(liqLevels, Liq.new(price = px, isHigh = isHigh, ln = ln, tag = tag))
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ① تتبّع قمم/قيعان الجلسات / SESSION HIGH-LOW TRACKING
+// ════════════════════════════════════════════════════════════════════════════
+// -- جلسة آسيا --
+var float asiaH = na
+var float asiaL = na
+if inAsia and not inAsia[1]                       // بداية الجلسة → تصفير
+    asiaH := high
+    asiaL := low
+else if inAsia
+    asiaH := math.max(nz(asiaH, high), high)
+    asiaL := math.min(nz(asiaL, low),  low)
+
+// -- جلسة لندن --
+var float londonH = na
+var float londonL = na
+if inLondon and not inLondon[1]
+    londonH := high
+    londonL := low
+else if inLondon
+    londonH := math.max(nz(londonH, high), high)
+    londonL := math.min(nz(londonL, low),  low)
+
+// -- قمة/قاع اليوم السابق (بدون repaint) --
+[pdh, pdl] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_off)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  رسم المستويات عند اكتمال الجلسات (فقط على الشمعة المُغلقة)
+// ════════════════════════════════════════════════════════════════════════════
+if barstate.isconfirmed
+    // نهاية جلسة آسيا → ثبّت مستوييها
+    if not inAsia and inAsia[1] and useAsia
+        f_addLevel(asiaH, true,  "Asia-H")
+        f_addLevel(asiaL, false, "Asia-L")
+    // نهاية جلسة لندن → ثبّت مستوييها
+    if not inLondon and inLondon[1] and useLondon
+        f_addLevel(londonH, true,  "London-H")
+        f_addLevel(londonL, false, "London-L")
+    // يوم جديد → ثبّت مستويي اليوم السابق
+    if newDay and usePrevDay and not na(pdh) and not na(pdl)
+        f_addLevel(pdh, true,  "PrevDay-H")
+        f_addLevel(pdl, false, "PrevDay-L")
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ② مدّ الخطوط + كشف الاختراق (إغلاق خارج المستوى ينهي الخط)
+// ════════════════════════════════════════════════════════════════════════════
+if barstate.isconfirmed and array.size(liqLevels) > 0
+    for i = array.size(liqLevels) - 1 to 0
+        Liq lv = array.get(liqLevels, i)
+        if not lv.broken
+            // اختراق = إغلاق كامل خارج المستوى (فوق القمة / تحت القاع)
+            broke = lv.isHigh ? close > lv.price : close < lv.price
+            if broke
+                lv.broken := true
+                line.set_x2(lv.ln, bar_index)     // الخط ينتهي عند نقطة الاختراق
+            else
+                line.set_x2(lv.ln, bar_index + 1) // استمرار المدّ للأمام
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ③ كشف الـ SWEEP (سحب السيولة) — داخل نافذة نيويورك فقط
+// ────────────────────────────────────────────────────────────────────────────
+//  الشرط: الفتيل يخترق المستوى لكن الإغلاق يعود داخله.
+//    • قاع : low  < level  و  close > level   (سحب أسفل ثم عودة للأعلى)
+//    • قمة : high > level  و  close < level   (سحب أعلى ثم عودة للأسفل)
+//  إغلاق خارج المستوى = اختراق وليس Sweep (يُعالَج ككسر أعلاه).
+// ════════════════════════════════════════════════════════════════════════════
+bool newSweep = false
+if barstate.isconfirmed and inNY and array.size(liqLevels) > 0
+    for i = 0 to array.size(liqLevels) - 1
+        Liq lv = array.get(liqLevels, i)
+        if not lv.broken and not lv.swept
+            sweptHigh =      lv.isHigh and high > lv.price and close < lv.price
+            sweptLow  = not lv.isHigh and low  < lv.price and close > lv.price
+            if sweptHigh or sweptLow
+                lv.swept := true
+                newSweep := true
+                yTip = lv.isHigh ? high : low                                   // طرف الفتيل
+                lbStyle = lv.isHigh ? label.style_label_down : label.style_label_up
+                lb = label.new(bar_index, yTip, "✕ SWEEP", xloc = xloc.bar_index, yloc = yloc.price, style = lbStyle, color = color.new(colSweep, 15), textcolor = color.white, size = size.small)
+                array.push(sweeps, Sweep.new(lb = lb, bar = bar_index, lvl = lv.price, isHigh = lv.isHigh))
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ④ تنظيف علامات الـ Sweep
+//    • حذف تلقائي بعد cleanupBars شمعة (شارت نظيف)
+//    • إلغاء فوري إذا أغلقت شمعتان متتاليتان خارج المستوى (اختراق حقيقي)
+// ════════════════════════════════════════════════════════════════════════════
+if barstate.isconfirmed and array.size(sweeps) > 0
+    for i = array.size(sweeps) - 1 to 0
+        Sweep s = array.get(sweeps, i)
+        outsideNow  = s.isHigh ? close    > s.lvl : close    < s.lvl
+        outsidePrev = s.isHigh ? close[1] > s.lvl : close[1] < s.lvl
+        if bar_index - s.bar > cleanupBars
+            label.delete(s.lb)
+            array.remove(sweeps, i)
+        else if outsideNow and outsidePrev                 // شمعتان خارج المستوى → إلغاء الإعداد
+            label.delete(s.lb)
+            array.remove(sweeps, i)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  التنبيهات / ALERTS
+// ════════════════════════════════════════════════════════════════════════════
+alertcondition(newSweep, "Sweep", "NY Liquidity Model: تم رصد Sweep / Liquidity sweep detected")
