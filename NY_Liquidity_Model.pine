@@ -1,15 +1,15 @@
 //@version=5
 // ════════════════════════════════════════════════════════════════════════════
-//  NY LIQUIDITY MODEL  —  الإصدار الكامل / FULL BUILD
+//  NY LIQUIDITY MODEL  —  محدّد مناطق (بلا توصية) / ZONE MAPPER (no trade calls)
 //  للعقود الآجلة NQ / MNQ / ES في جلسة نيويورك فقط
 //  Futures (NQ / MNQ / ES) — New York session only
 // ────────────────────────────────────────────────────────────────────────────
-//  الفريمات / TIMEFRAMES
-//    15m → مستويات السيولة والتحيّز (Liquidity levels & bias)  — مرجع
-//     5m → Sweep + SMT + MSS   (فريم التشغيل الأساسي / primary chart timeframe)
-//     1m → CISD (يُجلب عبر request.security بـ lookahead_off) + FVG + الدخول
+//  الغرض: تحديد ورسم مناطق النموذج بدقة فقط — لا دخول/ستوب/هدف/توصية.
+//  Purpose: precisely mark & draw the model zones only — no entry/stop/target.
+//  يعمل على فريم 5 دقائق أو دقيقة (يتكيّف مع فريم الشارت) / runs on 5m or 1m.
+// ────────────────────────────────────────────────────────────────────────────
 //  المكوّنات بالترتيب الزمني الإلزامي:
-//    ① Liquidity Levels → ② Sweep → ③ SMT → ④ Control Shift (MSS/CISD) → ⑤ FVG → Entry
+//    ① Liquidity Levels → ② Sweep → ③ SMT → ④ Control Shift (MSS/CISD) → ⑤ FVG zone
 // ════════════════════════════════════════════════════════════════════════════
 indicator("NY Liquidity Model", overlay = true, max_boxes_count = 50, max_lines_count = 100, max_labels_count = 50)
 
@@ -33,7 +33,6 @@ pivotLen    = input.int(3, "طول Swing pivot / Swing Pivot Length", minval = 1
 maxWait     = input.int(15, "أقصى شموع لتحوّل السيطرة / Max Bars for Control Shift", minval = 1, group = grpLogic)
 modeOpt     = input.string("MSS فقط / MSS only", "وضع تحوّل السيطرة / Control-Shift Mode", options = ["MSS فقط / MSS only", "CISD فقط / CISD only", "الاثنان / Both"], group = grpLogic, tooltip = "MSS = بنية (5m) | CISD = شمعة (1m) | الاثنان = CISD للتوقيت بعد تأكيد MSS")
 minTicks    = input.int(4, "أدنى حجم FVG (تك) / Min FVG Size (ticks)", minval = 0, group = grpLogic)
-minRR       = input.float(2.0, "أدنى R:R / Min R:R", minval = 0.1, step = 0.1, group = grpLogic)
 
 grpSMT      = "④ SMT / التباين"
 smtEnabled  = input.bool(true, "تفعيل SMT / Enable SMT", group = grpSMT)
@@ -47,7 +46,6 @@ colSMT      = input.color(#FFD700,                    "SMT",                    
 colMSS      = input.color(#FFFFFF,                    "MSS",                                group = grpStyle)
 colCISD     = input.color(#9370DB,                    "CISD",                               group = grpStyle)
 colFVG      = input.color(color.new(#2196F3, 80),     "FVG",                                group = grpStyle)
-colEntry    = input.color(color.new(#00E676, 85),     "منطقة الدخول / Entry Zone",          group = grpStyle)
 
 grpGen      = "⑥ عام / General"
 autoClean   = input.bool(false, "حذف الإشارات تلقائياً عند الإلغاء / Auto-delete signals on cancel", group = grpGen, tooltip = "معطّل افتراضياً: كل الإشارات (Sweep, SMT, MSS, CISD, FVG) تبقى ظاهرة على الشارت للمراجعة ولا تُحذف عند إلغاء الإعداد")
@@ -181,22 +179,6 @@ f_cisd() =>
 newCisdBull = not na(cbN) and not na(cbN[1]) and cbN > cbN[1]
 newCisdBear = not na(csN) and not na(csN[1]) and csN > csN[1]
 
-// أقرب / رئيسي من السيولة المعاكسة للأهداف
-f_targets(bool bull, float ref) =>
-    float nearest = na
-    float main    = na
-    if array.size(liqLevels) > 0
-        for i = 0 to array.size(liqLevels) - 1
-            Liq lv = array.get(liqLevels, i)
-            if not lv.broken
-                if bull and lv.isHigh and lv.price > ref
-                    nearest := na(nearest) ? lv.price : math.min(nearest, lv.price)
-                    main    := na(main)    ? lv.price : math.max(main,    lv.price)
-                if (not bull) and (not lv.isHigh) and lv.price < ref
-                    nearest := na(nearest) ? lv.price : math.max(nearest, lv.price)
-                    main    := na(main)    ? lv.price : math.min(main,    lv.price)
-    [nearest, main]
-
 // رسم خط تحوّل السيطرة (MSS أبيض / CISD بنفسجي) + ملصق — دالة عامة
 f_drawShift(float lvl, bool isMSS) =>
     col  = isMSS ? colMSS : colCISD
@@ -207,24 +189,23 @@ f_drawShift(float lvl, bool isMSS) =>
     [ln, lb]
 
 // ════════════════════════════════════════════════════════════════════════════
-//  آلة الحالة — إعداد واحد نشط في المرة / STATE MACHINE (one active setup)
-//    0 خامل | 1 بعد Sweep (بانتظار تحوّل السيطرة) | 2 بانتظار FVG | 3 جاهز | 4 تنفيذ
+//  آلة الحالة — تحديد المناطق فقط (بلا توصية) / ZONE-MAPPING STATE MACHINE
+//    0 خامل | 1 بعد Sweep (بانتظار تحوّل السيطرة) | 2 بانتظار FVG لرسم المنطقة
 // ════════════════════════════════════════════════════════════════════════════
 var int   st       = 0
 var bool  sBull    = false      // اتجاه الإعداد: سحب قاع → صاعد ، سحب قمة → هابط
 var float sLevel   = na         // المستوى المسحوب
-var float sWick    = na         // طرف فتيل الـ Sweep (للستوب)
+var float sWick    = na         // طرف فتيل الـ Sweep
 var int   sBar     = na
 var int   cnt      = 0          // عداد انتظار تحوّل السيطرة
-var bool  smtOn    = false      // نتيجة SMT المخزّنة (تحدد الحجم فقط)
+var bool  smtOn    = false      // نتيجة SMT المخزّنة (وسم فقط)
 var bool  mssDone  = false      // في وضع "الاثنان": هل تأكد MSS؟
 var int   shiftBar = na
 var float fvgTop   = na
 var float fvgBot   = na
 var float fvgMid   = na
 var int   fvgBar   = na
-var float rr       = na
-var int   sigToday = 0          // عدد الإشارات اليوم (حد أقصى 2)
+var int   zonesDay = 0          // عدد مناطق FVG المرسومة اليوم
 
 // كائنات الرسم للإعداد الحالي / current-setup drawing objects
 var label sweepLbl = na
@@ -234,17 +215,14 @@ var label mssLbl   = na
 var line  cisdLine = na
 var label cisdLbl  = na
 var box   fvgBox   = na
-var box   entryBox = na
-var label entryLbl = na
-var line  stopLn   = na
-var line  tp1Ln    = na
-var line  tp2Ln    = na
+var line  fvgMidLn = na          // خط منتصف الفجوة (Consequent Encroachment)
+var label fvgLbl   = na          // ملصق حدود المنطقة بالنقاط الدقيقة
 
 // أعلام التنبيهات (تُصفّر كل شمعة) / alert flags (reset each bar)
 bool aSweep = false
 bool aMSS   = false
 bool aCISD  = false
-bool aEntry = false
+bool aFVG   = false
 
 // ════════════════════════════════════════════════════════════════════════════
 //  المنطق الرئيسي — فقط على الشمعة المُغلقة / MAIN LOGIC (confirmed bars only)
@@ -252,9 +230,9 @@ bool aEntry = false
 if barstate.isconfirmed
     bool cancel = false   // طلب إلغاء الإعداد (يحذف كل عناصره)
 
-    // -- تصفير الإشارات يومياً --
+    // -- تصفير عدّاد المناطق يومياً --
     if newDay
-        sigToday := 0
+        zonesDay := 0
 
     // -- بناء مستويات السيولة عند نهاية كل جلسة --
     if not inAsia and inAsia[1] and useAsia
@@ -347,7 +325,8 @@ if barstate.isconfirmed
                     cancel := true       // انتهى العداد بلا تحوّل سيطرة
 
         // ───────────────────────────────────────────────────────────────────
-        // الحالة 2: ابحث عن FVG داخل نطاق حركة تحوّل السيطرة (خلال 10 شموع)
+        // الحالة 2: حدّد منطقة FVG وارسمها بدقة داخل حركة تحوّل السيطرة (10 شموع)
+        //   لا توصية ولا دخول/ستوب/هدف — فقط رسم المنطقة بحدودها الفعلية بدقة.
         // ───────────────────────────────────────────────────────────────────
         else if st == 2
             bullFVG   = sBull and high[2] < low[0]
@@ -356,74 +335,37 @@ if barstate.isconfirmed
             fBot      = sBull ? high[2] : high[0]
             sizeTicks = (fTop - fBot) / tick
             if (bullFVG or bearFVG) and sizeTicks >= minTicks
-                // FVG صالحة داخل الحركة — أقرب واحدة تُلتقط أولاً زمنياً
+                // منطقة FVG بحدودها الدقيقة — تبدأ من الشمعة الوسطى وتمتد للأمام
                 fvgTop := fTop
                 fvgBot := fBot
                 fvgMid := (fTop + fBot) / 2
                 fvgBar := bar_index
-                fvgBox := box.new(bar_index, fvgTop, bar_index + 20, fvgBot, xloc = xloc.bar_index, border_color = color.new(#2196F3, 40), bgcolor = colFVG)
-                // احسب Stop / Target / R:R
-                stop = sBull ? sWick - 2 * tick : sWick + 2 * tick
-                [tp1, tp2] = f_targets(sBull, fvgMid)
-                risk   = math.abs(fvgMid - stop)
-                reward = na(tp1) ? na : math.abs(tp1 - fvgMid)
-                rr := (na(reward) or risk == 0) ? na : reward / risk
-                if na(rr) or rr < minRR
-                    cancel := true       // R:R غير كافٍ → لا تُعرض الإشارة
-                else
-                    // منطقة الدخول عند 50% من الفجوة (النصف الأقرب للسعر)
-                    ezTop = sBull ? fvgMid : fvgTop
-                    ezBot = sBull ? fvgBot : fvgMid
-                    entryBox := box.new(bar_index, ezTop, bar_index + 10, ezBot, xloc = xloc.bar_index, border_color = color.new(#00E676, 40), bgcolor = colEntry)
-                    // ملصق Stop/Target/R:R + الحجم حسب SMT
-                    szTxt = smtEnabled ? (smtOn ? "FULL" : "HALF") : "FULL"
-                    txt = "ENTRY " + str.tostring(fvgMid, format.mintick) + "\nSL " + str.tostring(stop, format.mintick) + "\nTP1 " + (na(tp1) ? "-" : str.tostring(tp1, format.mintick)) + "\nTP2 " + (na(tp2) ? "-" : str.tostring(tp2, format.mintick)) + "\nR:R " + str.tostring(rr, "#.##") + "  " + szTxt
-                    entryLbl := label.new(bar_index, ezTop, txt, xloc = xloc.bar_index, style = label.style_label_left, color = color.new(color.black, 20), textcolor = color.white, size = size.small)
-                    // خطوط Stop / TP1 / TP2
-                    stopLn := line.new(bar_index, stop, bar_index + 15, stop, xloc = xloc.bar_index, color = color.red, style = line.style_dotted, width = 1)
-                    if not na(tp1)
-                        tp1Ln := line.new(bar_index, tp1, bar_index + 15, tp1, xloc = xloc.bar_index, color = color.green, style = line.style_dotted, width = 1)
-                    if not na(tp2)
-                        tp2Ln := line.new(bar_index, tp2, bar_index + 15, tp2, xloc = xloc.bar_index, color = color.green, style = line.style_dashed, width = 1)
-                    st := 3
+                fvgBox := box.new(bar_index - 1, fvgTop, bar_index + 20, fvgBot, xloc = xloc.bar_index, border_color = color.new(#2196F3, 40), bgcolor = colFVG)
+                // خط منتصف الفجوة (50% / Consequent Encroachment) — مرجع دقيق
+                fvgMidLn := line.new(bar_index - 1, fvgMid, bar_index + 20, fvgMid, xloc = xloc.bar_index, color = color.new(#2196F3, 20), style = line.style_dotted, width = 1)
+                // ملصق يعرض حدود المنطقة بالنقاط الدقيقة (بالملّي)
+                zTxt = "FVG  " + str.tostring(fvgTop, format.mintick) + " ⟷ " + str.tostring(fvgBot, format.mintick) + (smtOn ? "  •SMT" : "")
+                fvgLbl := label.new(bar_index + 20, fvgMid, zTxt, xloc = xloc.bar_index, style = label.style_label_left, color = color.new(#2196F3, 20), textcolor = color.white, size = size.tiny)
+                aFVG := true
+                zonesDay := zonesDay + 1
+                // فصل كائنات هذا الإعداد لتبقى ظاهرة والإعداد التالي يبدأ نظيفاً
+                sweepLbl := na
+                smtTri   := na
+                mssLine  := na
+                mssLbl   := na
+                cisdLine := na
+                cisdLbl  := na
+                fvgBox   := na
+                fvgMidLn := na
+                fvgLbl   := na
+                st := 0                   // اكتملت المنطقة → عُد لمسح المنطقة التالية
             else if not na(shiftBar) and bar_index - shiftBar > 10
-                cancel := true           // لا FVG خلال 10 شموع
-
-        // ───────────────────────────────────────────────────────────────────
-        // الحالة 3: جاهز — انتظر عودة السعر لـ 50% خلال 10 شموع (تنفيذ)
-        // ───────────────────────────────────────────────────────────────────
-        else if st == 3
-            filled = sBull ? low <= fvgMid : high >= fvgMid
-            if filled
-                st := 4
-                sigToday := sigToday + 1
-                aEntry := true            // جاهزية الدخول — تنبيه
-            else if not na(fvgBar) and bar_index - fvgBar > 10
-                cancel := true           // لم يعد السعر → إلغاء
-
-        // ───────────────────────────────────────────────────────────────────
-        // الحالة 4: تنفيذ — الإشارة اكتملت. افصل عناصرها لتبقى ظاهرة، وعُد للمسح
-        // ───────────────────────────────────────────────────────────────────
-        else if st == 4
-            // فصل الكائنات (بلا حذف) لتبقى على الشارت حتى الإزاحة التلقائية
-            sweepLbl := na
-            smtTri   := na
-            mssLine  := na
-            mssLbl   := na
-            cisdLine := na
-            cisdLbl  := na
-            fvgBox   := na
-            entryBox := na
-            entryLbl := na
-            stopLn   := na
-            tp1Ln    := na
-            tp2Ln    := na
-            st := 0                       // متاح لإعداد ثانٍ (بحد إشارتين/يوم)
+                cancel := true           // لا FVG خلال 10 شموع → إلغاء الإعداد
 
     // ═══════════════════════════════════════════════════════════════════════
     //  مسح السحب — يُرسم لكل مستوى ويبقى دائماً (مستقل عن آلة الحالة)
     //  كل Sweep + مثلث SMT يظهران للمراجعة ولا يُحذفان تلقائياً.
-    //  أول Sweep أثناء الخمول يُتبنّى كإعداد نشط (بحد إشارتين/يوم).
+    //  أول Sweep أثناء الخمول يُتبنّى كإعداد لتتبّع تحوّل السيطرة ثم رسم منطقة FVG.
     // ═══════════════════════════════════════════════════════════════════════
     if inNY and array.size(liqLevels) > 0
         for i = 0 to array.size(liqLevels) - 1
@@ -446,8 +388,8 @@ if barstate.isconfirmed
                         ytr  = dirBull ? low - 3 * tick : high + 3 * tick
                         smtObj := label.new(bar_index, ytr, "", xloc = xloc.bar_index, style = tstl, color = colSMT, size = size.tiny)
                     aSweep := true
-                    // تبنّي أول Sweep كإعداد نشط عند الخمول
-                    if st == 0 and sigToday < 2
+                    // تبنّي أول Sweep كإعداد نشط عند الخمول (بلا حد — كل المناطق تُرسم)
+                    if st == 0
                         sBull   := dirBull
                         sLevel  := lv.price
                         sWick   := yTip
@@ -472,11 +414,8 @@ if barstate.isconfirmed
             line.delete(cisdLine)
             label.delete(cisdLbl)
             box.delete(fvgBox)
-            box.delete(entryBox)
-            label.delete(entryLbl)
-            line.delete(stopLn)
-            line.delete(tp1Ln)
-            line.delete(tp2Ln)
+            line.delete(fvgMidLn)
+            label.delete(fvgLbl)
         sweepLbl := na
         smtTri   := na
         mssLine  := na
@@ -484,11 +423,8 @@ if barstate.isconfirmed
         cisdLine := na
         cisdLbl  := na
         fvgBox   := na
-        entryBox := na
-        entryLbl := na
-        stopLn   := na
-        tp1Ln    := na
-        tp2Ln    := na
+        fvgMidLn := na
+        fvgLbl   := na
         sBull    := false
         sLevel   := na
         sWick    := na
@@ -501,18 +437,16 @@ if barstate.isconfirmed
         fvgBot   := na
         fvgMid   := na
         fvgBar   := na
-        rr       := na
         st       := 0
 
 // ════════════════════════════════════════════════════════════════════════════
 //  ⑤ لوحة المعلومات / DASHBOARD (top-right)
 // ════════════════════════════════════════════════════════════════════════════
-var table dash = table.new(position.top_right, 2, 6, border_width = 1, frame_color = color.new(color.gray, 40), frame_width = 1)
+var table dash = table.new(position.top_right, 2, 5, border_width = 1, frame_color = color.new(color.gray, 40), frame_width = 1)
 if barstate.islast
-    stateTxt = st == 0 ? "خامل / Idle" : st == 1 ? "بانتظار MSS/CISD" : st == 2 ? "بانتظار FVG" : st == 3 ? "جاهز / Ready" : "تنفيذ / Live"
+    stateTxt = st == 0 ? "خامل / Idle" : st == 1 ? "بانتظار تحوّل / Wait Shift" : "بانتظار FVG / Wait FVG"
     smtTxt   = not smtEnabled ? "—" : (smtOn ? "✓" : "✗")
     cntTxt   = st == 1 ? str.tostring(math.max(cnt, 0)) : "—"
-    rrTxt    = na(rr) ? "—" : str.tostring(rr, "#.##")
     bg = color.new(color.black, 15)
     table.cell(dash, 0, 0, "NY LIQUIDITY", text_color = color.white, bgcolor = color.new(#FF8C00, 10), text_size = size.small)
     table.cell(dash, 1, 0, "MODEL",        text_color = color.white, bgcolor = color.new(#FF8C00, 10), text_size = size.small)
@@ -522,15 +456,13 @@ if barstate.islast
     table.cell(dash, 1, 2, smtTxt,          text_color = smtOn ? colSMT : color.silver, bgcolor = bg, text_size = size.small)
     table.cell(dash, 0, 3, "العداد",         text_color = color.silver, bgcolor = bg, text_size = size.small)
     table.cell(dash, 1, 3, cntTxt,          text_color = color.white,  bgcolor = bg, text_size = size.small)
-    table.cell(dash, 0, 4, "R:R",           text_color = color.silver, bgcolor = bg, text_size = size.small)
-    table.cell(dash, 1, 4, rrTxt,           text_color = color.white,  bgcolor = bg, text_size = size.small)
-    table.cell(dash, 0, 5, "إشارات اليوم",   text_color = color.silver, bgcolor = bg, text_size = size.small)
-    table.cell(dash, 1, 5, str.tostring(sigToday) + "/2", text_color = color.white, bgcolor = bg, text_size = size.small)
+    table.cell(dash, 0, 4, "مناطق اليوم",    text_color = color.silver, bgcolor = bg, text_size = size.small)
+    table.cell(dash, 1, 4, str.tostring(zonesDay), text_color = color.white, bgcolor = bg, text_size = size.small)
 
 // ════════════════════════════════════════════════════════════════════════════
 //  التنبيهات / ALERTS
 // ════════════════════════════════════════════════════════════════════════════
-alertcondition(aSweep, "Sweep",       "NY Liquidity Model: Sweep — تم سحب السيولة")
-alertcondition(aMSS,   "MSS",         "NY Liquidity Model: MSS — تحوّل السيطرة البنيوي")
-alertcondition(aCISD,  "CISD",        "NY Liquidity Model: CISD — تحوّل السيطرة الشمعي")
-alertcondition(aEntry, "Entry Ready", "NY Liquidity Model: جاهزية الدخول — Entry Ready")
+alertcondition(aSweep, "Sweep", "NY Liquidity Model: Sweep — تم سحب السيولة")
+alertcondition(aMSS,   "MSS",   "NY Liquidity Model: MSS — تحوّل السيطرة البنيوي")
+alertcondition(aCISD,  "CISD",  "NY Liquidity Model: CISD — تحوّل السيطرة الشمعي")
+alertcondition(aFVG,   "FVG",   "NY Liquidity Model: FVG — تحدّدت منطقة الفجوة")
